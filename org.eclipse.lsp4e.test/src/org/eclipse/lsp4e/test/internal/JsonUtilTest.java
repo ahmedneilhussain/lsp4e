@@ -12,9 +12,15 @@
 package org.eclipse.lsp4e.test.internal;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import java.util.List;
 
 import org.eclipse.lsp4e.internal.JsonUtil;
+import org.eclipse.lsp4j.CodeActionOptions;
 import org.eclipse.lsp4j.FileSystemWatcher;
+import org.eclipse.lsp4j.Registration;
 import org.eclipse.lsp4j.WatchKind;
 import org.junit.jupiter.api.Test;
 
@@ -34,6 +40,40 @@ public class JsonUtilTest {
 		
 		FileSystemWatcher copy = JsonUtil.LSP4J_GSON.fromJson(json, FileSystemWatcher.class);
 		assertEquals(original, copy);
+	}
+	
+	@Test
+	void testCodeActionUnserialization() throws Exception {
+		var original = new Registration();
+		original.setId("abc123");
+		original.setMethod("");
+		
+		// Set up a registration with the CodeActionOptions branch of the Boolean | CodeActionOptions payload
+		var options = new CodeActionOptions();
+		options.setCodeActionKinds(List.of("Action1", "Action2"));
+		options.setResolveProvider(Boolean.FALSE);
+		
+		original.setRegisterOptions(options);
+		
+		String json = JsonUtil.LSP4J_GSON.toJson(original);
+		
+		var back = JsonUtil.LSP4J_GSON.fromJson(json, Registration.class);
+		assertEquals(back.getId(), "abc123");
+				
+		var optionsBack = JsonUtil.unserializeCodeActionRegistration(back);
+		assertTrue(optionsBack.isRight());
+		var actionKinds = optionsBack.getRight().getCodeActionKinds();
+		assertEquals(actionKinds.size(), 2);
+		assertEquals(actionKinds.get(0), "Action1");
+		assertFalse(optionsBack.getRight().getResolveProvider());
+		
+		// Set up a registration with the simple boolean branch
+		original.setRegisterOptions(Boolean.FALSE);
+		json = JsonUtil.LSP4J_GSON.toJson(original);
+		back = JsonUtil.LSP4J_GSON.fromJson(json, Registration.class);
+		optionsBack = JsonUtil.unserializeCodeActionRegistration(back);
+		assertTrue(optionsBack.isLeft());
+		assertFalse(optionsBack.getLeft());
 	}
 
 }

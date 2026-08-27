@@ -12,36 +12,53 @@
 package org.eclipse.lsp4e.test.commands;
 
 import static org.eclipse.lsp4e.test.utils.TestUtils.waitForCondition;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Predicate;
 
 import org.eclipse.core.resources.IFile;
+import org.eclipse.core.resources.IMarker;
 import org.eclipse.jface.text.IDocument;
 import org.eclipse.lsp4e.LSPEclipseUtils;
 import org.eclipse.lsp4e.LanguageServers;
 import org.eclipse.lsp4e.LanguageServiceAccessor;
+import org.eclipse.lsp4e.test.codeactions.CodeActionTests;
 import org.eclipse.lsp4e.test.utils.AbstractTestWithProject;
 import org.eclipse.lsp4e.test.utils.TestUtils;
 import org.eclipse.lsp4e.tests.mock.MockLanguageServer;
 import org.eclipse.lsp4e.tests.mock.MockLanguageServerFactory;
 import org.eclipse.lsp4e.tests.mock.MockWorkspaceService;
+import org.eclipse.lsp4j.CodeAction;
+import org.eclipse.lsp4j.CodeActionKind;
+import org.eclipse.lsp4j.CodeActionOptions;
+import org.eclipse.lsp4j.Command;
+import org.eclipse.lsp4j.Diagnostic;
+import org.eclipse.lsp4j.DiagnosticSeverity;
 import org.eclipse.lsp4j.DidChangeWatchedFilesParams;
 import org.eclipse.lsp4j.ExecuteCommandOptions;
 import org.eclipse.lsp4j.FileChangeType;
+import org.eclipse.lsp4j.Position;
+import org.eclipse.lsp4j.Range;
 import org.eclipse.lsp4j.Registration;
 import org.eclipse.lsp4j.RegistrationParams;
 import org.eclipse.lsp4j.ServerCapabilities;
+import org.eclipse.lsp4j.TextEdit;
 import org.eclipse.lsp4j.Unregistration;
 import org.eclipse.lsp4j.UnregistrationParams;
+import org.eclipse.lsp4j.WorkspaceEdit;
 import org.eclipse.lsp4j.WorkspaceFoldersOptions;
 import org.eclipse.lsp4j.WorkspaceServerCapabilities;
+import org.eclipse.lsp4j.jsonrpc.messages.Either;
 import org.eclipse.lsp4j.services.LanguageClient;
+import org.eclipse.ui.texteditor.AbstractTextEditor;
 import org.junit.jupiter.api.Test;
 
 public class DynamicRegistrationTest extends AbstractTestWithProject {
@@ -49,7 +66,7 @@ public class DynamicRegistrationTest extends AbstractTestWithProject {
 	private static final String WORKSPACE_EXECUTE_COMMAND = "workspace/executeCommand";
 	private static final String WORKSPACE_DID_CHANGE_FOLDERS = "workspace/didChangeWorkspaceFolders";
 	private static final String WORKSPACE_DID_CHANGE_WATCHED_FILES = "workspace/didChangeWatchedFiles";
-
+	private static final String CODE_ACTION = "textDocument/codeAction";
 	@Test
 	public void testCommandRegistration(MockLanguageServerFactory factory) throws Exception {
 		IFile testFile = TestUtils.createFile(project, "shouldUseExtension.lspt", "");
@@ -73,6 +90,77 @@ public class DynamicRegistrationTest extends AbstractTestWithProject {
 		}
 		assertFalse(LanguageServiceAccessor.hasActiveLanguageServers(handlesCommand("test.command")));
 		assertFalse(LanguageServiceAccessor.hasActiveLanguageServers(handlesCommand("test.command.2")));
+	}
+	
+	@Test
+	public void testDynamicCodeActionRegistration(MockLanguageServerFactory factory) throws Exception {
+		final var testFile = TestUtils.createFile(project, "shouldUseExtension.lspt", "");
+		final var resolveCount = new AtomicInteger(0);
+
+		final var staticCapabilities = MockLanguageServer.defaultServerCapabilities();
+		staticCapabilities.setCodeActionProvider(Boolean.FALSE);
+		factory.withCapabilities(() -> staticCapabilities);
+		factory.withConfiguration((idx, server)-> {
+			server.getTextDocumentService().setCodeActionResolver(action -> {
+				resolveCount.incrementAndGet();
+				return action;
+			});
+			
+			final var tEdit = new TextEdit(new Range(new Position(0, 0), new Position(0, 5)), "fixed");
+			final var wEdit = new WorkspaceEdit(Collections.singletonMap(testFile.getLocationURI().toString(), List.of(tEdit)));
+			final var codeAction = new CodeAction("fixme");
+			codeAction.setCommand(new Command("editCommand", "mockEditCommand", List.of(wEdit)));
+			server.setCodeActions(List.of(Either.forRight(codeAction)));
+			server.setDiagnostics(List.of(
+					new Diagnostic(new Range(new Position(0, 0), new Position(0, 5)), "error", DiagnosticSeverity.Error, null)));
+
+		});
+		
+		// Make sure mock language server is created...
+		final var document = LSPEclipseUtils.getDocument(testFile);
+		assertNotNull(document);
+		LanguageServers.forDocument(document).anyMatching();
+		
+		waitForCondition(5_000, () -> !factory.getServers().isEmpty());
+		assertTrue(LanguageServiceAccessor.hasActiveLanguageServers(c -> true));
+		assertFalse(LanguageServiceAccessor.hasActiveLanguageServers(handlesCodeActions()));
+		
+		final var codeActionOptions = new CodeActionOptions();
+		codeActionOptions.setCodeActionKinds(List.of(CodeActionKind.QuickFix, CodeActionKind.Refactor));
+		codeActionOptions.setResolveProvider(Boolean.FALSE);
+		
+		final UUID firstRegistration = registerCodeActionProvider(factory.getServer(), Either.forRight(codeActionOptions));
+		waitForCondition(5_000, () -> LanguageServiceAccessor.hasActiveLanguageServers(handlesCodeActions()));
+		
+		assertTrue(LanguageServiceAccessor.hasActiveLanguageServers(handlesCodeActions(options -> {
+			return options.getCodeActionKinds().containsAll(List.of(CodeActionKind.QuickFix, CodeActionKind.Refactor))
+					&& Boolean.FALSE.equals(options.getResolveProvider());
+		})));
+		
+
+		final var editor = (AbstractTextEditor)TestUtils.openEditor(testFile);
+		IMarker m = CodeActionTests.assertDiagnostics(testFile, "error", "fixme");
+		CodeActionTests.assertResolution(editor, m, "fixed");
+		
+		// Our dynamic registration specifies we don't support the codeAction/resolve method
+		assertEquals(0, resolveCount.get());
+		
+		// Now restore the static state (doesn't handle code actions)
+		TestUtils.closeEditor(editor, false);
+		unregister(firstRegistration, CODE_ACTION, factory.getServer());
+		waitForCondition(5_000, () -> !LanguageServiceAccessor.hasActiveLanguageServers(handlesCodeActions()));
+
+		codeActionOptions.setResolveProvider(true);
+		@SuppressWarnings("unused")
+		final UUID secondRegistration = registerCodeActionProvider(factory.getServer(), Either.forRight(codeActionOptions));
+		waitForCondition(5_000, () -> LanguageServiceAccessor.hasActiveLanguageServers(handlesCodeActions()));
+		
+		final var editor2 = (AbstractTextEditor)TestUtils.openEditor(testFile);
+		IMarker m2 = CodeActionTests.assertDiagnostics(testFile, "error", "fixme");
+		CodeActionTests.assertResolution(editor2, m2, "fixed");
+		
+		// We now support the codeAction/resolve method
+		assertEquals(1, resolveCount.get());
 	}
 
 	@Test
@@ -176,11 +264,37 @@ public class DynamicRegistrationTest extends AbstractTestWithProject {
 		client.registerCapability(new RegistrationParams(List.of(registration))).get(1, TimeUnit.SECONDS);
 		return id;
 	}
+	
+	private UUID registerCodeActionProvider(MockLanguageServer server, Either<Boolean, CodeActionOptions> options) throws Exception {
+		UUID id = UUID.randomUUID();
+		LanguageClient client = server.getRemoteProxy();
+		final var registration = new Registration();
+		registration.setId(id.toString());
+		registration.setMethod(CODE_ACTION);
+		registration.setRegisterOptions(options);
+		client.registerCapability(new RegistrationParams(List.of(registration))).get(1, TimeUnit.SECONDS);
+
+		return id;
+	}
 
 	private Predicate<ServerCapabilities> handlesCommand(String command) {
 		return cap -> {
 			ExecuteCommandOptions commandProvider = cap.getExecuteCommandProvider();
 			return commandProvider != null && commandProvider.getCommands().contains(command);
+		};
+	}
+	
+	private Predicate<ServerCapabilities> handlesCodeActions() {
+		return cap -> {
+			final var codeActionCaps = cap.getCodeActionProvider();
+			return codeActionCaps.isRight() || codeActionCaps.getLeft() ;
+		};
+	}
+	
+	private Predicate<ServerCapabilities> handlesCodeActions(Predicate<CodeActionOptions> options) {
+		return cap -> {
+			final var codeActionCaps = cap.getCodeActionProvider();
+			return codeActionCaps.isRight() && options.test(codeActionCaps.getRight());
 		};
 	}
 

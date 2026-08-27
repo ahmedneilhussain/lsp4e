@@ -1219,6 +1219,13 @@ public class LanguageServerWrapper {
 			case "textDocument/codeAction": //$NON-NLS-1$
 				final Either<Boolean, CodeActionOptions> beforeRegistration = serverCapabilities.getCodeActionProvider();
 				serverCapabilities.setCodeActionProvider(Boolean.TRUE);
+
+				try {
+					final var options = JsonUtil.unserializeCodeActionRegistration(reg);
+					serverCapabilities.setCodeActionProvider(options);
+				} catch (Exception ex) {
+					LanguageServerPlugin.logError(ex);
+				}
 				addRegistration(reg, () -> serverCapabilities.setCodeActionProvider(beforeRegistration));
 				break;
 			case "textDocument/completion": { //$NON-NLS-1$
