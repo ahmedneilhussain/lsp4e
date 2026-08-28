@@ -49,14 +49,10 @@ public class CodeActionCompletionProposal implements ICompletionProposal {
 	static boolean isCodeActionResolveSupported(@Nullable ServerCapabilities capabilities) {
 		if (capabilities != null) {
 			Either<Boolean, CodeActionOptions> caProvider = capabilities.getCodeActionProvider();
-			if (caProvider.isLeft()) {
-				return caProvider.getLeft();
-			} else if (caProvider.isRight()) {
-				CodeActionOptions options = caProvider.getRight();
-				var resolveProvider = options.getResolveProvider();
-				if (resolveProvider != null)
-					return resolveProvider;
-			}
+			// codeAction/resolve is only supported if the server explicitly says so; a plain
+			// "codeActionProvider: true" does not imply it
+			return caProvider != null && caProvider.isRight()
+					&& Boolean.TRUE.equals(caProvider.getRight().getResolveProvider());
 		}
 		return false;
 	}
