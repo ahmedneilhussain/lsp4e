@@ -28,12 +28,10 @@ import java.io.UncheckedIOException;
 import java.net.URI;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Objects;
-import java.util.Set;
 import java.util.Timer;
 import java.util.TimerTask;
 import java.util.concurrent.CancellationException;
@@ -65,7 +63,6 @@ import org.eclipse.core.resources.IResourceDelta;
 import org.eclipse.core.resources.ResourcesPlugin;
 import org.eclipse.core.resources.WorkspaceJob;
 import org.eclipse.core.runtime.Adapters;
-import org.eclipse.core.runtime.Assert;
 import org.eclipse.core.runtime.CoreException;
 import org.eclipse.core.runtime.IPath;
 import org.eclipse.core.runtime.IProduct;
@@ -83,50 +80,32 @@ import org.eclipse.lsp4e.LanguageServersRegistry.LanguageServerDefinition;
 import org.eclipse.lsp4e.client.DefaultLanguageClient;
 import org.eclipse.lsp4e.internal.ArrayUtil;
 import org.eclipse.lsp4e.internal.CancellationUtil;
+import org.eclipse.lsp4e.internal.DynamicRegistrationManager;
 import org.eclipse.lsp4e.internal.FileBufferListenerAdapter;
-import org.eclipse.lsp4e.internal.JsonUtil;
 import org.eclipse.lsp4e.internal.SupportedFeatures;
 import org.eclipse.lsp4e.internal.files.FileSystemWatcherManager;
 import org.eclipse.lsp4e.server.StreamConnectionProvider;
 import org.eclipse.lsp4e.ui.Messages;
 import org.eclipse.lsp4j.ClientCapabilities;
 import org.eclipse.lsp4j.ClientInfo;
-import org.eclipse.lsp4j.CodeActionOptions;
-import org.eclipse.lsp4j.CodeActionRegistrationOptions;
-import org.eclipse.lsp4j.CompletionOptions;
-import org.eclipse.lsp4j.CompletionRegistrationOptions;
 import org.eclipse.lsp4j.DidChangeWatchedFilesParams;
-import org.eclipse.lsp4j.DidChangeWatchedFilesRegistrationOptions;
 import org.eclipse.lsp4j.DidChangeWorkspaceFoldersParams;
 import org.eclipse.lsp4j.DidSaveTextDocumentParams;
-import org.eclipse.lsp4j.DocumentFormattingRegistrationOptions;
-import org.eclipse.lsp4j.DocumentOnTypeFormattingOptions;
-import org.eclipse.lsp4j.DocumentOnTypeFormattingRegistrationOptions;
-import org.eclipse.lsp4j.DocumentRangeFormattingRegistrationOptions;
-import org.eclipse.lsp4j.ExecuteCommandOptions;
-import org.eclipse.lsp4j.ExecuteCommandRegistrationOptions;
 import org.eclipse.lsp4j.FileChangeType;
 import org.eclipse.lsp4j.FileEvent;
 import org.eclipse.lsp4j.InitializeParams;
 import org.eclipse.lsp4j.InitializeResult;
 import org.eclipse.lsp4j.InitializedParams;
-import org.eclipse.lsp4j.Registration;
 import org.eclipse.lsp4j.RegistrationParams;
-import org.eclipse.lsp4j.SelectionRangeRegistrationOptions;
 import org.eclipse.lsp4j.ServerCapabilities;
 import org.eclipse.lsp4j.ServerInfo;
 import org.eclipse.lsp4j.TextDocumentSyncKind;
 import org.eclipse.lsp4j.TextDocumentSyncOptions;
-import org.eclipse.lsp4j.TypeHierarchyRegistrationOptions;
 import org.eclipse.lsp4j.UnregistrationParams;
 import org.eclipse.lsp4j.WatchKind;
 import org.eclipse.lsp4j.WindowClientCapabilities;
 import org.eclipse.lsp4j.WorkspaceFolder;
 import org.eclipse.lsp4j.WorkspaceFoldersChangeEvent;
-import org.eclipse.lsp4j.WorkspaceFoldersOptions;
-import org.eclipse.lsp4j.WorkspaceServerCapabilities;
-import org.eclipse.lsp4j.WorkspaceSymbolOptions;
-import org.eclipse.lsp4j.WorkspaceSymbolRegistrationOptions;
 import org.eclipse.lsp4j.jsonrpc.Launcher;
 import org.eclipse.lsp4j.jsonrpc.MessageConsumer;
 import org.eclipse.lsp4j.jsonrpc.ResponseErrorException;
@@ -268,7 +247,6 @@ public class LanguageServerWrapper {
 	private @Nullable CompletableFuture<@Nullable Void> initializeFuture;
 
 	private volatile @Nullable InitializeResult initializeResult;
-	private volatile @Nullable ServerCapabilities serverCapabilities;
 	private volatile @Nullable ServerInfo serverInfo;
 
 	private final AtomicReference<@Nullable IProgressMonitor> initializeFutureMonitorRef = new AtomicReference<>();
@@ -284,53 +262,14 @@ public class LanguageServerWrapper {
 
 	private LanguageServerContext context = new LanguageServerContext();
 
-	/**
-	 * Map containing unregistration handlers for dynamic capability registrations.
-	 */
-	/** The capabilities from the {@code initialize} result; never modified after initialization. */
-	private volatile @Nullable ServerCapabilities staticCapabilities;
-
-	/**
-	 * Live dynamic registrations by registration id, in registration order. See
-	 * {@link #registerCapability(RegistrationParams)}.
-	 */
-	private final Map<String, DynamicRegistration> dynamicRegistrations = new LinkedHashMap<>();
-
-	private record DynamicRegistration(String method, @Nullable Object options) {
-	}
-
-	private static final String METHOD_CODE_ACTION = "textDocument/codeAction"; //$NON-NLS-1$
-	private static final String METHOD_COMPLETION = "textDocument/completion"; //$NON-NLS-1$
-	private static final String METHOD_FORMATTING = "textDocument/formatting"; //$NON-NLS-1$
-	private static final String METHOD_RANGE_FORMATTING = "textDocument/rangeFormatting"; //$NON-NLS-1$
-	private static final String METHOD_ON_TYPE_FORMATTING = "textDocument/onTypeFormatting"; //$NON-NLS-1$
-	private static final String METHOD_SELECTION_RANGE = "textDocument/selectionRange"; //$NON-NLS-1$
-	private static final String METHOD_TYPE_HIERARCHY = "textDocument/typeHierarchy"; //$NON-NLS-1$
-	private static final String METHOD_WORKSPACE_SYMBOL = "workspace/symbol"; //$NON-NLS-1$
-	private static final String METHOD_EXECUTE_COMMAND = "workspace/executeCommand"; //$NON-NLS-1$
-	private static final String METHOD_DID_CHANGE_WATCHED_FILES = "workspace/didChangeWatchedFiles"; //$NON-NLS-1$
-	private static final String METHOD_DID_CHANGE_WORKSPACE_FOLDERS = "workspace/didChangeWorkspaceFolders"; //$NON-NLS-1$
-
-	/** The LSP4J type of {@code Registration.registerOptions} for each supported method. */
-	private static final Map<String, Class<?>> REGISTRATION_OPTIONS_TYPES = Map.ofEntries( //
-			Map.entry(METHOD_CODE_ACTION, CodeActionRegistrationOptions.class), //
-			Map.entry(METHOD_COMPLETION, CompletionRegistrationOptions.class), //
-			Map.entry(METHOD_FORMATTING, DocumentFormattingRegistrationOptions.class), //
-			Map.entry(METHOD_RANGE_FORMATTING, DocumentRangeFormattingRegistrationOptions.class), //
-			Map.entry(METHOD_ON_TYPE_FORMATTING, DocumentOnTypeFormattingRegistrationOptions.class), //
-			Map.entry(METHOD_SELECTION_RANGE, SelectionRangeRegistrationOptions.class), //
-			Map.entry(METHOD_TYPE_HIERARCHY, TypeHierarchyRegistrationOptions.class), //
-			Map.entry(METHOD_WORKSPACE_SYMBOL, WorkspaceSymbolRegistrationOptions.class), //
-			Map.entry(METHOD_EXECUTE_COMMAND, ExecuteCommandRegistrationOptions.class), //
-			Map.entry(METHOD_DID_CHANGE_WATCHED_FILES, DidChangeWatchedFilesRegistrationOptions.class));
-
-	/** Methods for which several concurrent registrations are legitimate (they do not carry a document selector). */
-	private static final Set<String> ADDITIVE_REGISTRATION_METHODS = Set.of(METHOD_EXECUTE_COMMAND,
-			METHOD_DID_CHANGE_WATCHED_FILES, METHOD_DID_CHANGE_WORKSPACE_FOLDERS);
 	private boolean initiallySupportsWorkspaceFolders = false;
 	private final IResourceChangeListener workspaceFolderUpdater = new WorkspaceFolderListener();
 
-	private final FileSystemWatcherManager fileSystemWatcherManager;
+	/**
+	 * Tracks the static and dynamically registered server capabilities; owns the
+	 * {@link FileSystemWatcherManager}.
+	 */
+	private final DynamicRegistrationManager registrationManager;
 	private final WatchedFilesListener watchedFilesListener = new WatchedFilesListener();
 
 	/* Backwards compatible constructor */
@@ -372,7 +311,8 @@ public class LanguageServerWrapper {
 		this.errorProcessor = Executors
 				.newSingleThreadExecutor(new ThreadFactoryBuilder().setNameFormat(errorsThreadNameFormat).build());
 
-		this.fileSystemWatcherManager = new FileSystemWatcherManager(initialProject);
+		this.registrationManager = new DynamicRegistrationManager(new FileSystemWatcherManager(initialProject),
+				this::capabilitiesChanged);
 		// Read preference to determine whether to enable the workspace resource fallback for this server.
 		this.resourceFallbackEnabled = isNonBufferedFileListenerEnabled();
 	}
@@ -546,10 +486,9 @@ public class LanguageServerWrapper {
 				synchronized (workingContext) {
 					markInitializationProgress(workingContext);
 					initializeResult = res;
-					staticCapabilities = res.getCapabilities();
-					serverCapabilities = res.getCapabilities();
+					registrationManager.setStaticCapabilities(res.getCapabilities());
 					serverInfo = res.getServerInfo();
-					this.initiallySupportsWorkspaceFolders = supportsWorkspaceFolders(serverCapabilities);
+					this.initiallySupportsWorkspaceFolders = supportsWorkspaceFolders(res.getCapabilities());
 				}
 			}).thenRun(() -> {
 				synchronized (workingContext) {
@@ -801,15 +740,10 @@ public class LanguageServerWrapper {
 			this.languageClient.dispose();
 		}
 
-		this.serverCapabilities = null;
-		this.staticCapabilities = null;
-		synchronized (dynamicRegistrations) {
-			this.dynamicRegistrations.clear();
-		}
+		registrationManager.clear();
 
 		ResourcesPlugin.getWorkspace().removeResourceChangeListener(workspaceFolderUpdater);
 		ResourcesPlugin.getWorkspace().removeResourceChangeListener(watchedFilesListener);
-		fileSystemWatcherManager.clear();
 
 		CompletableFuture.runAsync(workingContext::close);
 
@@ -909,7 +843,7 @@ public class LanguageServerWrapper {
 				LanguageServerPlugin.logWarning("Could not get if the workspace folder capability is supported due to timeout after 1 second"); //$NON-NLS-1$
 			}
 		}
-		return initiallySupportsWorkspaceFolders || supportsWorkspaceFolders(serverCapabilities);
+		return initiallySupportsWorkspaceFolders || supportsWorkspaceFolders(registrationManager.getCapabilities());
 	}
 
 	/**
@@ -941,7 +875,7 @@ public class LanguageServerWrapper {
 					return;
 				}
 				TextDocumentSyncKind syncKind = initializeFuture == null ? null
-						: castNonNull(serverCapabilities).getTextDocumentSync().map(Functions.identity(), TextDocumentSyncOptions::getChange);
+						: castNonNull(registrationManager.getCapabilities()).getTextDocumentSync().map(Functions.identity(), TextDocumentSyncOptions::getChange);
 				final var listener = new DocumentContentSynchronizer(this, castNonNull(context.languageServer), theDocument, syncKind);
 				theDocument.addPrenotifiedDocumentListener(listener);
 				LanguageServerWrapper.this.connectedDocuments.put(uri, listener);
@@ -1160,7 +1094,7 @@ public class LanguageServerWrapper {
 			LanguageServerPlugin.logError(e);
 		}
 
-		return this.serverCapabilities;
+		return registrationManager.getCapabilities();
 	}
 
 	/**
@@ -1170,7 +1104,7 @@ public class LanguageServerWrapper {
 	 * immediately after initialization or if it fails to start.
 	 */
 	public CompletableFuture<@Nullable ServerCapabilities> getServerCapabilitiesAsync() {
-		return getInitializedServer().thenCompose(ls -> CompletableFuture.completedFuture(this.serverCapabilities));
+		return getInitializedServer().thenCompose(ls -> CompletableFuture.completedFuture(registrationManager.getCapabilities()));
 	}
 
 	public CompletableFuture<@Nullable ServerInfo> getServerInfoAsync() {
@@ -1193,192 +1127,44 @@ public class LanguageServerWrapper {
 
 	/**
 	 * Applies the dynamic capability registrations sent by the server via
-	 * {@code client/registerCapability}.
-	 * <p>
-	 * The static capabilities from the {@code initialize} result are never modified. Instead, the
-	 * effective {@link #serverCapabilities} are recomputed from the static capabilities plus all
-	 * currently live registrations, so that unregistering never has to "undo" anything and the
-	 * result does not depend on the order of (un)registrations.
-	 * <p>
-	 * Limitation: {@code documentSelector}s are not supported; every registration is assumed to
-	 * apply to all documents handled by this server. If a server sends several registrations for
-	 * the same method (i.e. for different selectors), the most recent one wins.
+	 * {@code client/registerCapability}. See {@link DynamicRegistrationManager} for the
+	 * capability-recomputation model and its limitations.
 	 */
 	public void registerCapability(RegistrationParams params) {
-		Assert.isNotNull(this.staticCapabilities,
-				"Dynamic capability registration failed! Server not yet initialized?"); //$NON-NLS-1$
-		synchronized (dynamicRegistrations) {
-			for (final Registration reg : params.getRegistrations()) {
-				final String id = reg.getId();
-				final String method = reg.getMethod();
-				if (dynamicRegistrations.containsKey(id)) {
-					LanguageServerPlugin.logWarning("A dynamic registration with id '" + id //$NON-NLS-1$
-							+ "' already exists and will be replaced."); //$NON-NLS-1$
-				} else if (!ADDITIVE_REGISTRATION_METHODS.contains(method)
-						&& dynamicRegistrations.values().stream().anyMatch(r -> method.equals(r.method()))) {
-					LanguageServerPlugin.logWarning("Multiple dynamic registrations for '" + method //$NON-NLS-1$
-							+ "'. Document selectors are not supported; the most recent registration will be used for all documents."); //$NON-NLS-1$
-				}
-
-				Object options = null;
-				final Class<?> optionsType = REGISTRATION_OPTIONS_TYPES.get(method);
-				if (optionsType != null) {
-					try {
-						options = JsonUtil.registrationOptions(reg, optionsType);
-					} catch (final Exception ex) {
-						LanguageServerPlugin.logError("Failed to decode options of dynamic registration for '" + method + "'", ex); //$NON-NLS-1$ //$NON-NLS-2$
-					}
-				}
-
-				if (METHOD_DID_CHANGE_WATCHED_FILES.equals(method)
-						&& options instanceof DidChangeWatchedFilesRegistrationOptions watchedFilesOptions) {
-					fileSystemWatcherManager.registerFileSystemWatchers(id, watchedFilesOptions.getWatchers());
-				}
-				// Always record the registration, even without usable options, so unregistration is clean
-				dynamicRegistrations.put(id, new DynamicRegistration(method, options));
-			}
-		}
-		recomputeCapabilities();
+		registrationManager.registerCapability(params);
 	}
 
 	public void unregisterCapability(UnregistrationParams params) {
-		synchronized (dynamicRegistrations) {
-			params.getUnregisterations().forEach(unreg -> {
-				final DynamicRegistration removed = dynamicRegistrations.remove(unreg.getId());
-				if (removed != null && METHOD_DID_CHANGE_WATCHED_FILES.equals(removed.method())) {
-					fileSystemWatcherManager.unregisterFileSystemWatchers(unreg.getId());
-				}
-			});
-		}
-		recomputeCapabilities();
+		registrationManager.unregisterCapability(params);
 	}
 
 	/**
-	 * Recomputes the effective {@link #serverCapabilities} from {@link #staticCapabilities} and
-	 * the live {@link #dynamicRegistrations}, then applies any resulting side effects.
+	 * Applies the side effects of a change to the effective server capabilities: (de)activates
+	 * the watched-files listener and starts watching projects if workspace folders have become
+	 * supported.
 	 */
-	private void recomputeCapabilities() {
-		final ServerCapabilities staticCaps = this.staticCapabilities;
-		if (staticCaps == null) {
-			return;
-		}
-		final boolean supportedWorkspaceFoldersBefore = initiallySupportsWorkspaceFolders
-				|| supportsWorkspaceFolders(this.serverCapabilities);
-		final ServerCapabilities effective = JsonUtil.deepCopy(staticCaps, ServerCapabilities.class);
-		synchronized (dynamicRegistrations) {
-			// insertion order: for methods registered more than once, the most recent registration wins
-			dynamicRegistrations.values().forEach(reg -> applyRegistration(effective, reg));
-		}
-		this.serverCapabilities = effective;
-
-		if (fileSystemWatcherManager.hasFilePatterns()) {
+	private void capabilitiesChanged(final @Nullable ServerCapabilities oldCapabilities,
+			final ServerCapabilities newCapabilities) {
+		if (registrationManager.getFileSystemWatcherManager().hasFilePatterns()) {
 			enableWatchedFiles();
 		} else {
 			disableWatchedFiles();
 		}
-		if (!supportedWorkspaceFoldersBefore && supportsWorkspaceFolders(effective)) {
+		final boolean supportedWorkspaceFoldersBefore = initiallySupportsWorkspaceFolders
+				|| supportsWorkspaceFolders(oldCapabilities);
+		if (!supportedWorkspaceFoldersBefore && supportsWorkspaceFolders(newCapabilities)) {
 			watchProjects();
 		}
 	}
 
-	private static void applyRegistration(final ServerCapabilities caps, final DynamicRegistration reg) {
-		final Object options = reg.options();
-		switch (reg.method()) {
-		case METHOD_CODE_ACTION -> {
-			if (options instanceof CodeActionRegistrationOptions o) {
-				final var codeActionOptions = new CodeActionOptions(o.getCodeActionKinds());
-				codeActionOptions.setResolveProvider(o.getResolveProvider());
-				caps.setCodeActionProvider(codeActionOptions);
-			} else {
-				caps.setCodeActionProvider(Boolean.TRUE);
-			}
-		}
-		case METHOD_COMPLETION -> {
-			final var completionOptions = new CompletionOptions();
-			if (options instanceof CompletionRegistrationOptions o) {
-				completionOptions.setTriggerCharacters(o.getTriggerCharacters());
-				completionOptions.setAllCommitCharacters(o.getAllCommitCharacters());
-				completionOptions.setResolveProvider(o.getResolveProvider());
-				completionOptions.setCompletionItem(o.getCompletionItem());
-			}
-			caps.setCompletionProvider(completionOptions);
-		}
-		case METHOD_FORMATTING -> caps.setDocumentFormattingProvider(Boolean.TRUE);
-		case METHOD_RANGE_FORMATTING -> caps.setDocumentRangeFormattingProvider(Boolean.TRUE);
-		case METHOD_ON_TYPE_FORMATTING -> {
-			if (options instanceof DocumentOnTypeFormattingRegistrationOptions o && o.getFirstTriggerCharacter() != null) {
-				caps.setDocumentOnTypeFormattingProvider(
-						new DocumentOnTypeFormattingOptions(o.getFirstTriggerCharacter(), o.getMoreTriggerCharacter()));
-			} else {
-				LanguageServerPlugin.logWarning("Ignoring dynamic registration for '" + METHOD_ON_TYPE_FORMATTING //$NON-NLS-1$
-						+ "' without a firstTriggerCharacter"); //$NON-NLS-1$
-			}
-		}
-		case METHOD_SELECTION_RANGE -> {
-			if (options instanceof SelectionRangeRegistrationOptions o) {
-				caps.setSelectionRangeProvider(o);
-			} else {
-				caps.setSelectionRangeProvider(Boolean.TRUE);
-			}
-		}
-		case METHOD_TYPE_HIERARCHY -> {
-			if (options instanceof TypeHierarchyRegistrationOptions o) {
-				caps.setTypeHierarchyProvider(o);
-			} else {
-				caps.setTypeHierarchyProvider(Boolean.TRUE);
-			}
-		}
-		case METHOD_WORKSPACE_SYMBOL -> {
-			if (options instanceof WorkspaceSymbolOptions o) { // WorkspaceSymbolRegistrationOptions extends WorkspaceSymbolOptions
-				caps.setWorkspaceSymbolProvider(o);
-			} else {
-				caps.setWorkspaceSymbolProvider(Boolean.TRUE);
-			}
-		}
-		case METHOD_EXECUTE_COMMAND -> {
-			// several executeCommand registrations are legitimate and additive
-			if (options instanceof ExecuteCommandOptions o && o.getCommands() != null) {
-				ExecuteCommandOptions provider = caps.getExecuteCommandProvider();
-				if (provider == null) {
-					provider = new ExecuteCommandOptions(new ArrayList<>());
-					caps.setExecuteCommandProvider(provider);
-				}
-				final List<String> commands = new ArrayList<>(provider.getCommands());
-				for (final String command : o.getCommands()) {
-					if (!commands.contains(command)) {
-						commands.add(command);
-					}
-				}
-				provider.setCommands(commands);
-			}
-		}
-		case METHOD_DID_CHANGE_WORKSPACE_FOLDERS -> {
-			WorkspaceServerCapabilities workspace = caps.getWorkspace();
-			if (workspace == null) {
-				workspace = new WorkspaceServerCapabilities();
-				caps.setWorkspace(workspace);
-			}
-			WorkspaceFoldersOptions folders = workspace.getWorkspaceFolders();
-			if (folders == null) {
-				folders = new WorkspaceFoldersOptions();
-				workspace.setWorkspaceFolders(folders);
-			}
-			folders.setSupported(Boolean.TRUE);
-		}
-		default -> {
-			// METHOD_DID_CHANGE_WATCHED_FILES and unknown methods: no capability change
-		}
-		}
-	}
-
 	synchronized void disableWatchedFiles() {
-		if (!fileSystemWatcherManager.hasFilePatterns()) {
+		if (!registrationManager.getFileSystemWatcherManager().hasFilePatterns()) {
 			ResourcesPlugin.getWorkspace().removeResourceChangeListener(watchedFilesListener);
 		}
 	}
 
 	synchronized void enableWatchedFiles() {
-		if (fileSystemWatcherManager.hasFilePatterns()) {
+		if (registrationManager.getFileSystemWatcherManager().hasFilePatterns()) {
 			ResourcesPlugin.getWorkspace().addResourceChangeListener(watchedFilesListener, IResourceChangeEvent.POST_CHANGE);
 		}
 	}
@@ -1545,7 +1331,7 @@ public class LanguageServerWrapper {
 		@Override
 		public void resourceChanged(final IResourceChangeEvent event) {
 			// Fast-path: if no watchers are registered, skip work entirely
-			if (!fileSystemWatcherManager.hasFilePatterns())
+			if (!registrationManager.getFileSystemWatcherManager().hasFilePatterns())
 				return;
 
 			final List<WatchedFileChange> changes = collectChanges(event);
@@ -1571,7 +1357,7 @@ public class LanguageServerWrapper {
 				final var fileEvents = new ArrayList<FileEvent>();
 				for (final WatchedFileChange change : changes) {
 					final int watchKind = toWatchKind(change.changeType());
-					if (!fileSystemWatcherManager.isMatchFilePattern(change.uri(), watchKind)) {
+					if (!registrationManager.getFileSystemWatcherManager().isMatchFilePattern(change.uri(), watchKind)) {
 						continue;
 					}
 					final var fileEvent = new FileEvent();
