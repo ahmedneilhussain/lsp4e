@@ -45,6 +45,7 @@ import org.eclipse.lsp4j.Command;
 import org.eclipse.lsp4j.Diagnostic;
 import org.eclipse.lsp4j.DiagnosticSeverity;
 import org.eclipse.lsp4j.DidChangeWatchedFilesParams;
+import org.eclipse.lsp4j.DocumentFilter;
 import org.eclipse.lsp4j.ExecuteCommandOptions;
 import org.eclipse.lsp4j.FileChangeType;
 import org.eclipse.lsp4j.Position;
@@ -186,7 +187,7 @@ public class DynamicRegistrationTest extends AbstractTestWithProject {
 		final var refactor = new CodeActionRegistrationOptions();
 		refactor.setCodeActionKinds(List.of(CodeActionKind.Refactor));
 
-		// Document selectors are not supported: the most recent registration wins as a whole
+		// Without document selectors both registrations apply everywhere: the most recent wins as a whole
 		final UUID first = registerCodeActionProvider(factory.getServer(), quickFix);
 		assertTrue(LanguageServiceAccessor.hasActiveLanguageServers(handlesCodeActionKinds(List.of(CodeActionKind.QuickFix))));
 		final UUID second = registerCodeActionProvider(factory.getServer(), refactor);
@@ -206,6 +207,47 @@ public class DynamicRegistrationTest extends AbstractTestWithProject {
 		assertTrue(LanguageServiceAccessor.hasActiveLanguageServers(handlesCodeActionKinds(List.of(CodeActionKind.QuickFix))));
 		unregister(third, TEXT_DOCUMENT_CODE_ACTION, factory.getServer());
 		assertTrue(LanguageServiceAccessor.hasActiveLanguageServers(handlesCodeActionKinds(List.of(CodeActionKind.Source))));
+	}
+
+	@Test
+	public void testDocumentSelectorScopesRegistrationPerDocument(MockLanguageServerFactory factory) throws Exception {
+		final var staticCapabilities = MockLanguageServer.defaultServerCapabilities();
+		staticCapabilities.setCodeActionProvider(Boolean.FALSE);
+		factory.withCapabilities(() -> staticCapabilities);
+
+		final IFile matchingFile = TestUtils.createFile(project, "matching.lspt", "");
+		final IFile otherFile = TestUtils.createFile(project, "other.lspt", "");
+		final IDocument matchingDocument = LSPEclipseUtils.getDocument(matchingFile);
+		final IDocument otherDocument = LSPEclipseUtils.getDocument(otherFile);
+		assertNotNull(matchingDocument);
+		assertNotNull(otherDocument);
+		LanguageServers.forDocument(matchingDocument).anyMatching();
+		waitForCondition(5_000, () -> !factory.getServers().isEmpty());
+		LanguageServers.forDocument(otherDocument).anyMatching();
+		assertTrue(LanguageServiceAccessor.hasActiveLanguageServers(c -> true));
+
+		// register codeAction support scoped by a glob pattern to matching.lspt only
+		final var filter = new DocumentFilter();
+		filter.setPattern("**/matching.lspt");
+		final var options = new CodeActionRegistrationOptions();
+		options.setCodeActionKinds(List.of(CodeActionKind.QuickFix));
+		options.setDocumentSelector(List.of(filter));
+		final UUID registration = registerCodeActionProvider(factory.getServer(), options);
+		try {
+			// document-scoped queries see the capability only for the matching document
+			assertTrue(LanguageServiceAccessor.hasActiveLanguageServers(matchingDocument, handlesCodeActions()));
+			assertFalse(LanguageServiceAccessor.hasActiveLanguageServers(otherDocument, handlesCodeActions()));
+			// document-independent queries use the union view, in which every registration applies
+			assertTrue(LanguageServiceAccessor.hasActiveLanguageServers(handlesCodeActions()));
+			// the LanguageServers executor selects/skips the server per document accordingly
+			assertTrue(LanguageServers.forDocument(matchingDocument)
+					.withCapability(ServerCapabilities::getCodeActionProvider).anyMatching());
+			assertFalse(LanguageServers.forDocument(otherDocument)
+					.withCapability(ServerCapabilities::getCodeActionProvider).anyMatching());
+		} finally {
+			unregister(registration, TEXT_DOCUMENT_CODE_ACTION, factory.getServer());
+		}
+		assertFalse(LanguageServiceAccessor.hasActiveLanguageServers(matchingDocument, handlesCodeActions()));
 	}
 
 	@Test

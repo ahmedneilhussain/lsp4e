@@ -15,13 +15,17 @@ package org.eclipse.lsp4e.test.internal;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.net.URI;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import org.eclipse.jdt.annotation.Nullable;
 import org.eclipse.lsp4e.internal.DynamicRegistrationManager;
@@ -31,9 +35,11 @@ import org.eclipse.lsp4j.CodeActionKind;
 import org.eclipse.lsp4j.CodeActionOptions;
 import org.eclipse.lsp4j.CodeActionRegistrationOptions;
 import org.eclipse.lsp4j.DidChangeWatchedFilesRegistrationOptions;
+import org.eclipse.lsp4j.DocumentFilter;
 import org.eclipse.lsp4j.FileSystemWatcher;
 import org.eclipse.lsp4j.Registration;
 import org.eclipse.lsp4j.RegistrationParams;
+import org.eclipse.lsp4j.RelativePattern;
 import org.eclipse.lsp4j.ServerCapabilities;
 import org.eclipse.lsp4j.Unregistration;
 import org.eclipse.lsp4j.UnregistrationParams;
@@ -50,14 +56,18 @@ class DynamicRegistrationManagerTest {
 	private static final String CODE_ACTION = "textDocument/codeAction";
 	private static final String WATCHED_FILES = "workspace/didChangeWatchedFiles";
 
+	private static final URI RUST_FILE = URI.create("file:///proj/foo.rs");
+	private static final URI MANIFEST_FILE = URI.create("file:///proj/Cargo.toml");
+
 	private record CapabilitiesChange(@Nullable ServerCapabilities oldCapabilities,
 			ServerCapabilities newCapabilities) {
 	}
 
 	private final List<CapabilitiesChange> changes = new ArrayList<>();
+	private final Map<URI, String> languageIds = new HashMap<>(Map.of(RUST_FILE, "rs", MANIFEST_FILE, "toml"));
 	private final FileSystemWatcherManager watcherManager = new FileSystemWatcherManager((Path) null);
 	private final DynamicRegistrationManager manager = new DynamicRegistrationManager(watcherManager,
-			(oldCaps, newCaps) -> changes.add(new CapabilitiesChange(oldCaps, newCaps)));
+			languageIds::get, (oldCaps, newCaps) -> changes.add(new CapabilitiesChange(oldCaps, newCaps)));
 
 	private static ServerCapabilities staticCapabilities() {
 		final var caps = new ServerCapabilities();
@@ -78,19 +88,50 @@ class DynamicRegistrationManagerTest {
 		manager.unregisterCapability(new UnregistrationParams(List.of(new Unregistration(id, method))));
 	}
 
-	private static CodeActionRegistrationOptions codeActionOptions(String kind) {
+	private static CodeActionRegistrationOptions codeActionOptions(String kind, DocumentFilter... selector) {
 		final var options = new CodeActionRegistrationOptions();
 		options.setCodeActionKinds(List.of(kind));
+		if (selector.length > 0) {
+			options.setDocumentSelector(List.of(selector));
+		}
 		return options;
 	}
 
+	private static DocumentFilter languageFilter(String language) {
+		final var filter = new DocumentFilter();
+		filter.setLanguage(language);
+		return filter;
+	}
+
+	private static DocumentFilter patternFilter(String pattern) {
+		final var filter = new DocumentFilter();
+		filter.setPattern(pattern);
+		return filter;
+	}
+
+	private static DocumentFilter schemeFilter(String scheme) {
+		final var filter = new DocumentFilter();
+		filter.setScheme(scheme);
+		return filter;
+	}
+
 	private List<String> effectiveCodeActionKinds() {
-		final ServerCapabilities caps = manager.getCapabilities();
+		return effectiveCodeActionKinds(null);
+	}
+
+	private List<String> effectiveCodeActionKinds(@Nullable URI uri) {
+		final ServerCapabilities caps = manager.getCapabilities(uri);
 		assertNotNull(caps);
 		final Either<Boolean, CodeActionOptions> provider = caps.getCodeActionProvider();
 		assertNotNull(provider);
 		assertTrue(provider.isRight(), "expected CodeActionOptions but was: " + provider);
 		return provider.getRight().getCodeActionKinds();
+	}
+
+	private void assertCodeActionsUnsupported(@Nullable URI uri) {
+		final ServerCapabilities caps = manager.getCapabilities(uri);
+		assertNotNull(caps);
+		assertEquals(Boolean.FALSE, caps.getCodeActionProvider().getLeft());
 	}
 
 	@Test
@@ -201,5 +242,124 @@ class DynamicRegistrationManagerTest {
 		assertNull(manager.getCapabilities());
 		assertFalse(watcherManager.hasFilePatterns());
 		assertTrue(changes.isEmpty(), "clear() must not notify the listener");
+	}
+
+	@Test
+	void languageSelectorScopesRegistrationPerDocument() {
+		manager.setStaticCapabilities(staticCapabilities());
+		register("r1", CODE_ACTION, codeActionOptions(CodeActionKind.QuickFix, languageFilter("rs")));
+
+		assertEquals(List.of(CodeActionKind.QuickFix), effectiveCodeActionKinds(RUST_FILE));
+		assertCodeActionsUnsupported(MANIFEST_FILE);
+		// the union view assumes every registration applies
+		assertEquals(List.of(CodeActionKind.QuickFix), effectiveCodeActionKinds(null));
+	}
+
+	@Test
+	void patternSelectorMatchesAbsolutePath() {
+		manager.setStaticCapabilities(staticCapabilities());
+		register("r1", CODE_ACTION, codeActionOptions(CodeActionKind.QuickFix, patternFilter("**/Cargo.toml")));
+
+		assertEquals(List.of(CodeActionKind.QuickFix), effectiveCodeActionKinds(MANIFEST_FILE));
+		assertCodeActionsUnsupported(RUST_FILE);
+	}
+
+	@Test
+	void relativePatternSelectorMatchesRelativeToItsBaseUri() {
+		manager.setStaticCapabilities(staticCapabilities());
+		final var relativePattern = new RelativePattern();
+		relativePattern.setBaseUri(Either.forRight("file:///proj")); //$NON-NLS-1$
+		relativePattern.setPattern("*.rs"); //$NON-NLS-1$
+		final var filter = new DocumentFilter();
+		filter.setPattern(relativePattern);
+		register("r1", CODE_ACTION, codeActionOptions(CodeActionKind.QuickFix, filter));
+
+		assertEquals(List.of(CodeActionKind.QuickFix), effectiveCodeActionKinds(RUST_FILE));
+		assertCodeActionsUnsupported(URI.create("file:///other/foo.rs"));
+	}
+
+	@Test
+	void schemeSelectorMatchesTheUriScheme() {
+		manager.setStaticCapabilities(staticCapabilities());
+		register("r1", CODE_ACTION, codeActionOptions(CodeActionKind.QuickFix, schemeFilter("untitled")));
+
+		assertCodeActionsUnsupported(RUST_FILE);
+		assertEquals(List.of(CodeActionKind.QuickFix),
+				effectiveCodeActionKinds(URI.create("untitled:Untitled-1.rs")));
+	}
+
+	@Test
+	void filterPropertiesAreConjunctive() {
+		manager.setStaticCapabilities(staticCapabilities());
+		final DocumentFilter filter = languageFilter("rs");
+		filter.setScheme("untitled");
+		register("r1", CODE_ACTION, codeActionOptions(CodeActionKind.QuickFix, filter));
+
+		// the language matches but the scheme does not: per spec the set properties are ANDed
+		assertCodeActionsUnsupported(RUST_FILE);
+	}
+
+	@Test
+	void selectorFiltersAreDisjunctive() {
+		manager.setStaticCapabilities(staticCapabilities());
+		register("r1", CODE_ACTION,
+				codeActionOptions(CodeActionKind.QuickFix, languageFilter("rs"), patternFilter("**/Cargo.toml")));
+
+		assertEquals(List.of(CodeActionKind.QuickFix), effectiveCodeActionKinds(RUST_FILE));
+		assertEquals(List.of(CodeActionKind.QuickFix), effectiveCodeActionKinds(MANIFEST_FILE));
+		assertCodeActionsUnsupported(URI.create("file:///proj/readme.md"));
+	}
+
+	@Test
+	void absentSelectorMatchesEveryDocument() {
+		manager.setStaticCapabilities(staticCapabilities());
+		register("r1", CODE_ACTION, codeActionOptions(CodeActionKind.QuickFix));
+
+		assertEquals(List.of(CodeActionKind.QuickFix), effectiveCodeActionKinds(RUST_FILE));
+		assertEquals(List.of(CodeActionKind.QuickFix), effectiveCodeActionKinds(MANIFEST_FILE));
+		// all registrations apply: identical to the union view
+		assertSame(manager.getCapabilities(), manager.getCapabilities(RUST_FILE));
+	}
+
+	@Test
+	void emptySelectorMatchesNoDocument() {
+		manager.setStaticCapabilities(staticCapabilities());
+		final var options = codeActionOptions(CodeActionKind.QuickFix);
+		options.setDocumentSelector(List.of());
+		register("r1", CODE_ACTION, options);
+
+		assertCodeActionsUnsupported(RUST_FILE);
+		assertCodeActionsUnsupported(MANIFEST_FILE);
+	}
+
+	@Test
+	void effectiveCapabilitiesAreCachedPerMatchingRegistrationSet() {
+		manager.setStaticCapabilities(staticCapabilities());
+		register("r1", CODE_ACTION, codeActionOptions(CodeActionKind.QuickFix, languageFilter("rs")));
+
+		languageIds.put(URI.create("file:///proj/bar.rs"), "rs");
+		final ServerCapabilities forFoo = manager.getCapabilities(RUST_FILE);
+		final ServerCapabilities forBar = manager.getCapabilities(URI.create("file:///proj/bar.rs"));
+		final ServerCapabilities forManifest = manager.getCapabilities(MANIFEST_FILE);
+		// same set of matching registrations: the same cached instance, not a recomputation
+		assertSame(forFoo, forBar);
+		assertSame(forFoo, manager.getCapabilities(RUST_FILE));
+		assertNotSame(forFoo, forManifest);
+	}
+
+	@Test
+	void overlappingSelectorsResolveToTheMostRecentRegistration() {
+		manager.setStaticCapabilities(staticCapabilities());
+		register("r1", CODE_ACTION, codeActionOptions(CodeActionKind.QuickFix, languageFilter("rs")));
+		register("r2", CODE_ACTION, codeActionOptions(CodeActionKind.Refactor, patternFilter("**/*.rs")));
+
+		// both registrations match: the most recently registered one wins
+		assertEquals(List.of(CodeActionKind.Refactor), effectiveCodeActionKinds(RUST_FILE));
+
+		// the per-set cache is invalidated by unregistration
+		unregister("r2", CODE_ACTION);
+		assertEquals(List.of(CodeActionKind.QuickFix), effectiveCodeActionKinds(RUST_FILE));
+		unregister("r1", CODE_ACTION);
+		assertCodeActionsUnsupported(RUST_FILE);
 	}
 }

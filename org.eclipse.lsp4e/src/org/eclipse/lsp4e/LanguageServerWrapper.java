@@ -27,7 +27,9 @@ import java.io.InputStreamReader;
 import java.io.UncheckedIOException;
 import java.net.URI;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
@@ -68,6 +70,7 @@ import org.eclipse.core.runtime.IPath;
 import org.eclipse.core.runtime.IProduct;
 import org.eclipse.core.runtime.IProgressMonitor;
 import org.eclipse.core.runtime.IStatus;
+import org.eclipse.core.runtime.Path;
 import org.eclipse.core.runtime.Platform;
 import org.eclipse.core.runtime.Status;
 import org.eclipse.core.runtime.SubMonitor;
@@ -272,6 +275,24 @@ public class LanguageServerWrapper {
 	private final DynamicRegistrationManager registrationManager;
 	private final WatchedFilesListener watchedFilesListener = new WatchedFilesListener();
 
+	private static final int LANGUAGE_ID_CACHE_SIZE = 100;
+
+	/**
+	 * Caches the language id computed for not-yet-connected documents by {@link #getLanguageId(URI)}
+	 * (for connected documents the id sent in {@code didOpen} is used directly). The language id of a
+	 * URI is stable, so this cache survives dynamic (un)registrations; it is bounded because
+	 * capability queries can pass arbitrarily many URIs over a server's lifetime.
+	 */
+	private final Map<URI, String> languageIdsByUri = Collections
+			.synchronizedMap(new LinkedHashMap<>(16, 0.75f, true) {
+				private static final long serialVersionUID = 1L;
+
+				@Override
+				protected boolean removeEldestEntry(final Map.@Nullable Entry<URI, String> eldest) {
+					return size() > LANGUAGE_ID_CACHE_SIZE;
+				}
+			});
+
 	/* Backwards compatible constructor */
 	public LanguageServerWrapper(IProject project, LanguageServerDefinition serverDefinition) {
 		this(project, serverDefinition, null);
@@ -312,7 +333,7 @@ public class LanguageServerWrapper {
 				.newSingleThreadExecutor(new ThreadFactoryBuilder().setNameFormat(errorsThreadNameFormat).build());
 
 		this.registrationManager = new DynamicRegistrationManager(new FileSystemWatcherManager(initialProject),
-				this::capabilitiesChanged);
+				this::getLanguageId, this::capabilitiesChanged);
 		// Read preference to determine whether to enable the workspace resource fallback for this server.
 		this.resourceFallbackEnabled = isNonBufferedFileListenerEnabled();
 	}
@@ -875,7 +896,7 @@ public class LanguageServerWrapper {
 					return;
 				}
 				TextDocumentSyncKind syncKind = initializeFuture == null ? null
-						: castNonNull(registrationManager.getCapabilities()).getTextDocumentSync().map(Functions.identity(), TextDocumentSyncOptions::getChange);
+						: castNonNull(registrationManager.getCapabilities(uri)).getTextDocumentSync().map(Functions.identity(), TextDocumentSyncOptions::getChange);
 				final var listener = new DocumentContentSynchronizer(this, castNonNull(context.languageServer), theDocument, syncKind);
 				theDocument.addPrenotifiedDocumentListener(listener);
 				LanguageServerWrapper.this.connectedDocuments.put(uri, listener);
@@ -1077,10 +1098,24 @@ public class LanguageServerWrapper {
 	 * <b>IMPORTANT:</b> If the server isn't yet initialized this method will be
 	 * blocking for up to 10 seconds!
 	 *
-	 * @return the server capabilities, or null if initialization job didn't
-	 *         complete
+	 * @return the server capabilities assuming every dynamic capability registration applies (the
+	 *         union view), or null if initialization job didn't complete
 	 */
 	public @Nullable ServerCapabilities getServerCapabilities() {
+		return getServerCapabilities(null);
+	}
+
+	/**
+	 * <b>IMPORTANT:</b> If the server isn't yet initialized this method will be
+	 * blocking for up to 10 seconds!
+	 *
+	 * @param uri the URI of the document the capabilities are queried for: dynamic capability
+	 *            registrations only contribute where their {@code documentSelector} matches it.
+	 *            {@code null} yields the union view in which every registration applies.
+	 * @return the effective server capabilities for the given document, or null if initialization
+	 *         job didn't complete
+	 */
+	public @Nullable ServerCapabilities getServerCapabilities(@Nullable URI uri) {
 		try {
 			getInitializedServer().get(10, TimeUnit.SECONDS);
 		} catch (TimeoutException e) {
@@ -1094,17 +1129,32 @@ public class LanguageServerWrapper {
 			LanguageServerPlugin.logError(e);
 		}
 
-		return registrationManager.getCapabilities();
+		return registrationManager.getCapabilities(uri);
 	}
 
 	/**
-	 * @return a {@link CompletableFuture} that provides the {@link ServerCapabilities}.
+	 * @return a {@link CompletableFuture} that provides the {@link ServerCapabilities}, assuming
+	 * every dynamic capability registration applies (the union view).
 	 * <p>
 	 * The {@link ServerCapabilities} will be {@code null} if the server shuts down
 	 * immediately after initialization or if it fails to start.
 	 */
 	public CompletableFuture<@Nullable ServerCapabilities> getServerCapabilitiesAsync() {
-		return getInitializedServer().thenCompose(ls -> CompletableFuture.completedFuture(registrationManager.getCapabilities()));
+		return getServerCapabilitiesAsync(null);
+	}
+
+	/**
+	 * @param uri the URI of the document the capabilities are queried for: dynamic capability
+	 *            registrations only contribute where their {@code documentSelector} matches it.
+	 *            {@code null} yields the union view in which every registration applies.
+	 * @return a {@link CompletableFuture} that provides the effective {@link ServerCapabilities}
+	 * for the given document.
+	 * <p>
+	 * The {@link ServerCapabilities} will be {@code null} if the server shuts down
+	 * immediately after initialization or if it fails to start.
+	 */
+	public CompletableFuture<@Nullable ServerCapabilities> getServerCapabilitiesAsync(@Nullable URI uri) {
+		return getInitializedServer().thenCompose(ls -> CompletableFuture.completedFuture(registrationManager.getCapabilities(uri)));
 	}
 
 	public CompletableFuture<@Nullable ServerInfo> getServerInfoAsync() {
@@ -1123,6 +1173,77 @@ public class LanguageServerWrapper {
 			}
 		}
 		return null;
+	}
+
+	/**
+	 * Returns the LSP language id of the document at the given URI for this server: for a connected
+	 * document the id that was sent in {@code textDocument/didOpen}, otherwise the id that would be
+	 * sent if the document were opened. Used to match the {@code documentSelector}s of dynamic
+	 * capability registrations, which must agree with what the server was told at {@code didOpen}.
+	 * <p>
+	 * Answers for unconnected documents are served read-through from {@link #languageIdsByUri}, so
+	 * repeated capability queries do not repeat the content-type lookup.
+	 */
+	String getLanguageId(URI uri) {
+		synchronized (connectedDocuments) {
+			DocumentContentSynchronizer synchronizer = connectedDocuments.get(uri);
+			if (synchronizer != null) {
+				return synchronizer.getLanguageId();
+			}
+		}
+		return castNonNull(languageIdsByUri.computeIfAbsent(uri, u -> computeLanguageIdImpl(u, null)));
+	}
+
+	/**
+	 * Computes the LSP language id to send in {@code textDocument/didOpen} for the given document:
+	 * the {@code languageId} declared in this server's content-type mappings if any, otherwise the
+	 * file extension, falling back to the last segment of the URI.
+	 * <p>
+	 * Deliberately not served from {@link #languageIdsByUri}: with the document in hand, content-type
+	 * detection is content-based and thus more authoritative than a cached name-based answer from an
+	 * earlier {@link #getLanguageId(URI)} call, so this always computes and overwrites the cache —
+	 * keeping post-disconnect queries consistent with what {@code didOpen} last sent.
+	 */
+	String computeLanguageId(URI uri, IDocument document) {
+		String languageId = computeLanguageIdImpl(uri, document);
+		languageIdsByUri.put(uri, languageId);
+		return languageId;
+	}
+
+	private String computeLanguageIdImpl(URI uri, @Nullable IDocument document) {
+		List<IContentType> contentTypes = document != null //
+				? LSPEclipseUtils.getDocumentContentTypes(document)
+				: getContentTypes(uri);
+		String languageId = getLanguageId(contentTypes.toArray(IContentType[]::new));
+		if (languageId == null && uri.getPath() != null) {
+			IPath path = Path.fromPortableString(uri.getPath());
+			languageId = path.getFileExtension();
+			if (languageId == null) {
+				languageId = path.lastSegment();
+			}
+		}
+		if (languageId == null && !uri.getSchemeSpecificPart().isEmpty()) {
+			String part = uri.getSchemeSpecificPart();
+			int lastSeparatorIndex = Math.max(part.lastIndexOf('.'), part.lastIndexOf('/'));
+			languageId = part.substring(lastSeparatorIndex + 1);
+		}
+		if (languageId == null) {
+			String uriString = uri.toString();
+			int lastSeparatorIndex = Math.max(uriString.lastIndexOf('.'), uriString.lastIndexOf('/'));
+			languageId = uriString.substring(lastSeparatorIndex + 1);
+		}
+		return languageId;
+	}
+
+	private static List<IContentType> getContentTypes(URI uri) {
+		if (LSPEclipseUtils.findResourceFor(uri) instanceof IFile file) {
+			return LSPEclipseUtils.getFileContentTypes(file);
+		}
+		String fileName = LSPEclipseUtils.getFileName(uri);
+		if (fileName != null) {
+			return List.of(Platform.getContentTypeManager().findContentTypesFor(fileName));
+		}
+		return List.of();
 	}
 
 	/**

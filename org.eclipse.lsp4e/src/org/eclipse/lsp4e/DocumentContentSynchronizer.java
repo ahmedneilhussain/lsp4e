@@ -31,9 +31,6 @@ import org.eclipse.core.filesystem.EFS;
 import org.eclipse.core.filesystem.IFileStore;
 import org.eclipse.core.runtime.Assert;
 import org.eclipse.core.runtime.CoreException;
-import org.eclipse.core.runtime.IPath;
-import org.eclipse.core.runtime.Path;
-import org.eclipse.core.runtime.content.IContentType;
 import org.eclipse.jdt.annotation.Nullable;
 import org.eclipse.jface.preference.IPreferenceStore;
 import org.eclipse.jface.text.BadLocationException;
@@ -76,6 +73,7 @@ final class DocumentContentSynchronizer implements IDocumentListener {
 	private final IDocument document;
 	private final URI fileUri;
 	private final TextDocumentSyncKind syncKind;
+	private final String languageId;
 
 	private int version = 0;
 	private @Nullable DidChangeTextDocumentParams changeParams;
@@ -111,31 +109,16 @@ final class DocumentContentSynchronizer implements IDocumentListener {
 		textDocument.setUri(fileUri.toASCIIString());
 		textDocument.setText(document.get());
 
-		List<IContentType> contentTypes = LSPEclipseUtils.getDocumentContentTypes(this.document);
-
-		String languageId = languageServerWrapper.getLanguageId(contentTypes.toArray(IContentType[]::new));
-
-		if (languageId == null && this.fileUri.getPath() != null) {
-			IPath path = Path.fromPortableString(this.fileUri.getPath());
-			languageId = path.getFileExtension();
-			if (languageId == null) {
-				languageId = path.lastSegment();
-			}
-		}
-		if (languageId == null && !this.fileUri.getSchemeSpecificPart().isEmpty()) {
-			String part = this.fileUri.getSchemeSpecificPart();
-			int lastSeparatorIndex = Math.max(part.lastIndexOf('.'), part.lastIndexOf('/'));
-			languageId = part.substring(lastSeparatorIndex + 1);
-		}
-		if (languageId == null) {
-			String uriString = uri.toString();
-			int lastSeparatorIndex = Math.max(uriString.lastIndexOf('.'), uriString.lastIndexOf('/'));
-			languageId = uriString.substring(lastSeparatorIndex + 1);
-		}
+		this.languageId = languageServerWrapper.computeLanguageId(fileUri, document);
 
 		textDocument.setLanguageId(languageId);
 		textDocument.setVersion(++version);
 		languageServer.getTextDocumentService().didOpen(new DidOpenTextDocumentParams(textDocument));
+	}
+
+	/** @return the LSP language id this document was announced with in {@code textDocument/didOpen} */
+	String getLanguageId() {
+		return languageId;
 	}
 
 
