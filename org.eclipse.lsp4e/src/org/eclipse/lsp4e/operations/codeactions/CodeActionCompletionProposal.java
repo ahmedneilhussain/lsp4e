@@ -61,7 +61,8 @@ public class CodeActionCompletionProposal implements ICompletionProposal {
 	public void apply(IDocument document) {
 		final var fcodeAction = this.fcodeAction;
 		if (fcodeAction != null) {
-			if (isCodeActionResolveSupported(serverWrapper.getServerCapabilities()) && fcodeAction.getEdit() == null) {
+			if (isCodeActionResolveSupported(serverWrapper.getServerCapabilities(LSPEclipseUtils.toUri(document)))
+					&& fcodeAction.getEdit() == null) {
 				// Unresolved code action "edit" property. Resolve it.
 				serverWrapper.execute(ls -> ls.getTextDocumentService().resolveCodeAction(fcodeAction)).thenAccept(this::apply);
 			} else {

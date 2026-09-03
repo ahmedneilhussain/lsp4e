@@ -192,7 +192,7 @@ final class DocumentContentSynchronizer implements IDocumentListener {
 	}
 
 	private boolean serverSupportsWillSaveWaitUntil() {
-		ServerCapabilities serverCapabilities = languageServerWrapper.getServerCapabilities();
+		ServerCapabilities serverCapabilities = languageServerWrapper.getServerCapabilities(fileUri);
 		if(serverCapabilities != null ) {
 			Either<TextDocumentSyncKind, TextDocumentSyncOptions> textDocumentSync = serverCapabilities.getTextDocumentSync();
 			if(textDocumentSync.isRight()) {
@@ -298,7 +298,7 @@ final class DocumentContentSynchronizer implements IDocumentListener {
 			ITextSelection textSelection) {
 		long modificationStamp = DocumentUtil.getDocumentModificationStamp(document);
 
-		return languageServerWrapper.getServerCapabilitiesAsync().thenCompose(capabilities -> {
+		return languageServerWrapper.getServerCapabilitiesAsync(fileUri).thenCompose(capabilities -> {
 			FormattingOptions formatOptions = LSPFormatter.getFormatOptions();
 			final var docId = new TextDocumentIdentifier(fileUri.toString());
 			if (capabilities != null && LSPFormatter.isDocumentRangeFormattingSupported(capabilities)
@@ -324,7 +324,7 @@ final class DocumentContentSynchronizer implements IDocumentListener {
 			return;
 		}
 		this.openSaveStamp = buffer.getModificationStamp();
-		ServerCapabilities serverCapabilities = languageServerWrapper.getServerCapabilities();
+		ServerCapabilities serverCapabilities = languageServerWrapper.getServerCapabilities(fileUri);
 		if (serverCapabilities != null) {
 			Either<TextDocumentSyncKind, TextDocumentSyncOptions> textDocumentSync = serverCapabilities
 					.getTextDocumentSync();
