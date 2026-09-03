@@ -80,37 +80,8 @@ public final class DynamicRegistrationManager {
 		void capabilitiesChanged(@Nullable ServerCapabilities oldCapabilities, ServerCapabilities newCapabilities);
 	}
 
-	private static final String METHOD_CODE_ACTION = "textDocument/codeAction"; //$NON-NLS-1$
-	private static final String METHOD_COMPLETION = "textDocument/completion"; //$NON-NLS-1$
-	private static final String METHOD_FORMATTING = "textDocument/formatting"; //$NON-NLS-1$
-	private static final String METHOD_RANGE_FORMATTING = "textDocument/rangeFormatting"; //$NON-NLS-1$
-	private static final String METHOD_ON_TYPE_FORMATTING = "textDocument/onTypeFormatting"; //$NON-NLS-1$
-	private static final String METHOD_SELECTION_RANGE = "textDocument/selectionRange"; //$NON-NLS-1$
-	private static final String METHOD_TYPE_HIERARCHY = "textDocument/typeHierarchy"; //$NON-NLS-1$
-	private static final String METHOD_WORKSPACE_SYMBOL = "workspace/symbol"; //$NON-NLS-1$
-	private static final String METHOD_EXECUTE_COMMAND = "workspace/executeCommand"; //$NON-NLS-1$
-	private static final String METHOD_DID_CHANGE_WATCHED_FILES = "workspace/didChangeWatchedFiles"; //$NON-NLS-1$
-	private static final String METHOD_DID_CHANGE_WORKSPACE_FOLDERS = "workspace/didChangeWorkspaceFolders"; //$NON-NLS-1$
-
-	/** The LSP4J type of {@code Registration.registerOptions} for each supported method. */
-	private static final Map<String, Class<?>> REGISTRATION_OPTIONS_TYPES = Map.ofEntries( //
-			Map.entry(METHOD_CODE_ACTION, CodeActionRegistrationOptions.class), //
-			Map.entry(METHOD_COMPLETION, CompletionRegistrationOptions.class), //
-			Map.entry(METHOD_FORMATTING, DocumentFormattingRegistrationOptions.class), //
-			Map.entry(METHOD_RANGE_FORMATTING, DocumentRangeFormattingRegistrationOptions.class), //
-			Map.entry(METHOD_ON_TYPE_FORMATTING, DocumentOnTypeFormattingRegistrationOptions.class), //
-			Map.entry(METHOD_SELECTION_RANGE, SelectionRangeRegistrationOptions.class), //
-			Map.entry(METHOD_TYPE_HIERARCHY, TypeHierarchyRegistrationOptions.class), //
-			Map.entry(METHOD_WORKSPACE_SYMBOL, WorkspaceSymbolRegistrationOptions.class), //
-			Map.entry(METHOD_EXECUTE_COMMAND, ExecuteCommandRegistrationOptions.class), //
-			Map.entry(METHOD_DID_CHANGE_WATCHED_FILES, DidChangeWatchedFilesRegistrationOptions.class));
-
-	/** Methods for which several concurrent registrations are legitimate (they do not carry a document selector). */
-	private static final Set<String> ADDITIVE_REGISTRATION_METHODS = Set.of(METHOD_EXECUTE_COMMAND,
-			METHOD_DID_CHANGE_WATCHED_FILES, METHOD_DID_CHANGE_WORKSPACE_FOLDERS);
-
-	private record DynamicRegistration(String method, @Nullable Object options,
-			@Nullable DocumentSelectorMatcher selector) {
+	private record DynamicRegistration(String method, @Nullable SupportedMethod supportedMethod,
+			@Nullable Object options, @Nullable DocumentSelectorMatcher selector) {
 
 		/** @return whether this registration applies to the document at the given URI */
 		boolean matches(final URI uri, final LanguageIdResolver languageIdResolver) {
@@ -248,9 +219,10 @@ public final class DynamicRegistrationManager {
 			for (final Registration reg : params.getRegistrations()) {
 				final String id = reg.getId();
 				final String method = reg.getMethod();
+				final SupportedMethod supported = SupportedMethod.forMethod(method);
 
 				Object options = null;
-				final Class<?> optionsType = REGISTRATION_OPTIONS_TYPES.get(method);
+				final Class<?> optionsType = supported == null ? null : supported.optionsType();
 				if (optionsType != null) {
 					try {
 						options = JsonUtil.registrationOptions(reg, optionsType);
@@ -265,21 +237,20 @@ public final class DynamicRegistrationManager {
 				if (dynamicRegistrations.containsKey(id)) {
 					LanguageServerPlugin.logWarning("A dynamic registration with id '" + id //$NON-NLS-1$
 							+ "' already exists and will be replaced."); //$NON-NLS-1$
-				} else if (!ADDITIVE_REGISTRATION_METHODS.contains(method) && selector == null
+				} else if (supported != null && !supported.isAdditive() && selector == null
 						&& dynamicRegistrations.values().stream()
-								.anyMatch(r -> method.equals(r.method()) && r.selector() == null)) {
+								.anyMatch(r -> r.supportedMethod() == supported && r.selector() == null)) {
 					// several registrations for one method are legitimate when they carry document
 					// selectors; without selectors they all apply everywhere and the most recent wins
 					LanguageServerPlugin.logWarning("Multiple dynamic registrations for '" + method //$NON-NLS-1$
 							+ "' without a document selector. The most recent registration will be used for all documents."); //$NON-NLS-1$
 				}
 
-				if (METHOD_DID_CHANGE_WATCHED_FILES.equals(method)
-						&& options instanceof DidChangeWatchedFilesRegistrationOptions watchedFilesOptions) {
-					fileSystemWatcherManager.registerFileSystemWatchers(id, watchedFilesOptions.getWatchers());
+				if (supported != null) {
+					supported.onRegister(id, options, fileSystemWatcherManager);
 				}
-				// Always record the registration, even without usable options, so unregistration is clean
-				dynamicRegistrations.put(id, new DynamicRegistration(method, options, selector));
+				// Always record the registration, even for unsupported methods, so unregistration is clean
+				dynamicRegistrations.put(id, new DynamicRegistration(method, supported, options, selector));
 			}
 			effectiveCapabilitiesBySelection.clear();
 		}
@@ -294,8 +265,9 @@ public final class DynamicRegistrationManager {
 		synchronized (dynamicRegistrations) {
 			params.getUnregisterations().forEach(unreg -> {
 				final DynamicRegistration removed = dynamicRegistrations.remove(unreg.getId());
-				if (removed != null && METHOD_DID_CHANGE_WATCHED_FILES.equals(removed.method())) {
-					fileSystemWatcherManager.unregisterFileSystemWatchers(unreg.getId());
+				final SupportedMethod supported = removed == null ? null : removed.supportedMethod();
+				if (supported != null) {
+					supported.onUnregister(unreg.getId(), fileSystemWatcherManager);
 				}
 			});
 			effectiveCapabilitiesBySelection.clear();
@@ -323,92 +295,218 @@ public final class DynamicRegistrationManager {
 	}
 
 	private static void applyRegistration(final ServerCapabilities caps, final DynamicRegistration reg) {
-		final Object options = reg.options();
-		switch (reg.method()) {
-		case METHOD_CODE_ACTION -> {
-			if (options instanceof CodeActionRegistrationOptions o) {
-				final var codeActionOptions = new CodeActionOptions(o.getCodeActionKinds());
-				codeActionOptions.setResolveProvider(o.getResolveProvider());
-				caps.setCodeActionProvider(codeActionOptions);
-			} else {
-				caps.setCodeActionProvider(Boolean.TRUE);
-			}
+		final SupportedMethod supported = reg.supportedMethod();
+		if (supported != null) {
+			supported.applyTo(caps, reg.options());
 		}
-		case METHOD_COMPLETION -> {
-			final var completionOptions = new CompletionOptions();
-			if (options instanceof CompletionRegistrationOptions o) {
-				completionOptions.setTriggerCharacters(o.getTriggerCharacters());
-				completionOptions.setAllCommitCharacters(o.getAllCommitCharacters());
-				completionOptions.setResolveProvider(o.getResolveProvider());
-				completionOptions.setCompletionItem(o.getCompletionItem());
-			}
-			caps.setCompletionProvider(completionOptions);
-		}
-		case METHOD_FORMATTING -> caps.setDocumentFormattingProvider(Boolean.TRUE);
-		case METHOD_RANGE_FORMATTING -> caps.setDocumentRangeFormattingProvider(Boolean.TRUE);
-		case METHOD_ON_TYPE_FORMATTING -> {
-			if (options instanceof DocumentOnTypeFormattingRegistrationOptions o && o.getFirstTriggerCharacter() != null) {
-				caps.setDocumentOnTypeFormattingProvider(
-						new DocumentOnTypeFormattingOptions(o.getFirstTriggerCharacter(), o.getMoreTriggerCharacter()));
-			} else {
-				LanguageServerPlugin.logWarning("Ignoring dynamic registration for '" + METHOD_ON_TYPE_FORMATTING //$NON-NLS-1$
-						+ "' without a firstTriggerCharacter"); //$NON-NLS-1$
-			}
-		}
-		case METHOD_SELECTION_RANGE -> {
-			if (options instanceof SelectionRangeRegistrationOptions o) {
-				caps.setSelectionRangeProvider(o);
-			} else {
-				caps.setSelectionRangeProvider(Boolean.TRUE);
-			}
-		}
-		case METHOD_TYPE_HIERARCHY -> {
-			if (options instanceof TypeHierarchyRegistrationOptions o) {
-				caps.setTypeHierarchyProvider(o);
-			} else {
-				caps.setTypeHierarchyProvider(Boolean.TRUE);
-			}
-		}
-		case METHOD_WORKSPACE_SYMBOL -> {
-			if (options instanceof WorkspaceSymbolOptions o) { // WorkspaceSymbolRegistrationOptions extends WorkspaceSymbolOptions
-				caps.setWorkspaceSymbolProvider(o);
-			} else {
-				caps.setWorkspaceSymbolProvider(Boolean.TRUE);
-			}
-		}
-		case METHOD_EXECUTE_COMMAND -> {
-			// several executeCommand registrations are legitimate and additive
-			if (options instanceof ExecuteCommandOptions o && o.getCommands() != null) {
-				ExecuteCommandOptions provider = caps.getExecuteCommandProvider();
-				if (provider == null) {
-					provider = new ExecuteCommandOptions(new ArrayList<>());
-					caps.setExecuteCommandProvider(provider);
+		// unsupported methods: no capability change
+	}
+
+	/**
+	 * The dynamic registration methods LSP4E supports. Each constant carries everything needed to
+	 * handle its method — the LSP method name, the LSP4J type of the {@code registerOptions} payload,
+	 * whether concurrent registrations are additive, how a registration transforms the effective
+	 * {@link ServerCapabilities}, and any register/unregister side effects — so that supporting a new
+	 * method means adding exactly one constant.
+	 */
+	private enum SupportedMethod {
+
+		CODE_ACTION("textDocument/codeAction", CodeActionRegistrationOptions.class, false) { //$NON-NLS-1$
+			@Override
+			void applyTo(final ServerCapabilities caps, final @Nullable Object options) {
+				if (options instanceof CodeActionRegistrationOptions o) {
+					final var codeActionOptions = new CodeActionOptions(o.getCodeActionKinds());
+					codeActionOptions.setResolveProvider(o.getResolveProvider());
+					caps.setCodeActionProvider(codeActionOptions);
+				} else {
+					caps.setCodeActionProvider(Boolean.TRUE);
 				}
-				final List<String> commands = new ArrayList<>(provider.getCommands());
-				for (final String command : o.getCommands()) {
-					if (!commands.contains(command)) {
-						commands.add(command);
+			}
+		},
+
+		COMPLETION("textDocument/completion", CompletionRegistrationOptions.class, false) { //$NON-NLS-1$
+			@Override
+			void applyTo(final ServerCapabilities caps, final @Nullable Object options) {
+				final var completionOptions = new CompletionOptions();
+				if (options instanceof CompletionRegistrationOptions o) {
+					completionOptions.setTriggerCharacters(o.getTriggerCharacters());
+					completionOptions.setAllCommitCharacters(o.getAllCommitCharacters());
+					completionOptions.setResolveProvider(o.getResolveProvider());
+					completionOptions.setCompletionItem(o.getCompletionItem());
+				}
+				caps.setCompletionProvider(completionOptions);
+			}
+		},
+
+		FORMATTING("textDocument/formatting", DocumentFormattingRegistrationOptions.class, false) { //$NON-NLS-1$
+			@Override
+			void applyTo(final ServerCapabilities caps, final @Nullable Object options) {
+				caps.setDocumentFormattingProvider(Boolean.TRUE);
+			}
+		},
+
+		RANGE_FORMATTING("textDocument/rangeFormatting", DocumentRangeFormattingRegistrationOptions.class, false) { //$NON-NLS-1$
+			@Override
+			void applyTo(final ServerCapabilities caps, final @Nullable Object options) {
+				caps.setDocumentRangeFormattingProvider(Boolean.TRUE);
+			}
+		},
+
+		ON_TYPE_FORMATTING("textDocument/onTypeFormatting", DocumentOnTypeFormattingRegistrationOptions.class, false) { //$NON-NLS-1$
+			@Override
+			void applyTo(final ServerCapabilities caps, final @Nullable Object options) {
+				if (options instanceof DocumentOnTypeFormattingRegistrationOptions o
+						&& o.getFirstTriggerCharacter() != null) {
+					caps.setDocumentOnTypeFormattingProvider(new DocumentOnTypeFormattingOptions(
+							o.getFirstTriggerCharacter(), o.getMoreTriggerCharacter()));
+				} else {
+					LanguageServerPlugin.logWarning("Ignoring dynamic registration for '" + method() //$NON-NLS-1$
+							+ "' without a firstTriggerCharacter"); //$NON-NLS-1$
+				}
+			}
+		},
+
+		SELECTION_RANGE("textDocument/selectionRange", SelectionRangeRegistrationOptions.class, false) { //$NON-NLS-1$
+			@Override
+			void applyTo(final ServerCapabilities caps, final @Nullable Object options) {
+				if (options instanceof SelectionRangeRegistrationOptions o) {
+					caps.setSelectionRangeProvider(o);
+				} else {
+					caps.setSelectionRangeProvider(Boolean.TRUE);
+				}
+			}
+		},
+
+		TYPE_HIERARCHY("textDocument/typeHierarchy", TypeHierarchyRegistrationOptions.class, false) { //$NON-NLS-1$
+			@Override
+			void applyTo(final ServerCapabilities caps, final @Nullable Object options) {
+				if (options instanceof TypeHierarchyRegistrationOptions o) {
+					caps.setTypeHierarchyProvider(o);
+				} else {
+					caps.setTypeHierarchyProvider(Boolean.TRUE);
+				}
+			}
+		},
+
+		WORKSPACE_SYMBOL("workspace/symbol", WorkspaceSymbolRegistrationOptions.class, false) { //$NON-NLS-1$
+			@Override
+			void applyTo(final ServerCapabilities caps, final @Nullable Object options) {
+				if (options instanceof WorkspaceSymbolOptions o) { // WorkspaceSymbolRegistrationOptions extends WorkspaceSymbolOptions
+					caps.setWorkspaceSymbolProvider(o);
+				} else {
+					caps.setWorkspaceSymbolProvider(Boolean.TRUE);
+				}
+			}
+		},
+
+		EXECUTE_COMMAND("workspace/executeCommand", ExecuteCommandRegistrationOptions.class, true) { //$NON-NLS-1$
+			@Override
+			void applyTo(final ServerCapabilities caps, final @Nullable Object options) {
+				// several executeCommand registrations are legitimate and additive
+				if (options instanceof ExecuteCommandOptions o && o.getCommands() != null) {
+					ExecuteCommandOptions provider = caps.getExecuteCommandProvider();
+					if (provider == null) {
+						provider = new ExecuteCommandOptions(new ArrayList<>());
+						caps.setExecuteCommandProvider(provider);
 					}
+					final List<String> commands = new ArrayList<>(provider.getCommands());
+					for (final String command : o.getCommands()) {
+						if (!commands.contains(command)) {
+							commands.add(command);
+						}
+					}
+					provider.setCommands(commands);
 				}
-				provider.setCommands(commands);
+			}
+		},
+
+		DID_CHANGE_WATCHED_FILES("workspace/didChangeWatchedFiles", DidChangeWatchedFilesRegistrationOptions.class, //$NON-NLS-1$
+				true) {
+			@Override
+			void applyTo(final ServerCapabilities caps, final @Nullable Object options) {
+				// watched files do not affect the effective capabilities; see onRegister/onUnregister
+			}
+
+			@Override
+			void onRegister(final String id, final @Nullable Object options,
+					final FileSystemWatcherManager watcherManager) {
+				if (options instanceof DidChangeWatchedFilesRegistrationOptions o) {
+					watcherManager.registerFileSystemWatchers(id, o.getWatchers());
+				}
+			}
+
+			@Override
+			void onUnregister(final String id, final FileSystemWatcherManager watcherManager) {
+				watcherManager.unregisterFileSystemWatchers(id);
+			}
+		},
+
+		DID_CHANGE_WORKSPACE_FOLDERS("workspace/didChangeWorkspaceFolders", null, true) { //$NON-NLS-1$
+			@Override
+			void applyTo(final ServerCapabilities caps, final @Nullable Object options) {
+				WorkspaceServerCapabilities workspace = caps.getWorkspace();
+				if (workspace == null) {
+					workspace = new WorkspaceServerCapabilities();
+					caps.setWorkspace(workspace);
+				}
+				WorkspaceFoldersOptions folders = workspace.getWorkspaceFolders();
+				if (folders == null) {
+					folders = new WorkspaceFoldersOptions();
+					workspace.setWorkspaceFolders(folders);
+				}
+				folders.setSupported(Boolean.TRUE);
+			}
+		};
+
+		private static final Map<String, SupportedMethod> BY_METHOD = new HashMap<>();
+		static {
+			for (final SupportedMethod supported : values()) {
+				BY_METHOD.put(supported.method, supported);
 			}
 		}
-		case METHOD_DID_CHANGE_WORKSPACE_FOLDERS -> {
-			WorkspaceServerCapabilities workspace = caps.getWorkspace();
-			if (workspace == null) {
-				workspace = new WorkspaceServerCapabilities();
-				caps.setWorkspace(workspace);
-			}
-			WorkspaceFoldersOptions folders = workspace.getWorkspaceFolders();
-			if (folders == null) {
-				folders = new WorkspaceFoldersOptions();
-				workspace.setWorkspaceFolders(folders);
-			}
-			folders.setSupported(Boolean.TRUE);
+
+		static @Nullable SupportedMethod forMethod(final String method) {
+			return BY_METHOD.get(method);
 		}
-		default -> {
-			// METHOD_DID_CHANGE_WATCHED_FILES and unknown methods: no capability change
+
+		private final String method;
+		private final @Nullable Class<?> optionsType;
+		private final boolean additive;
+
+		SupportedMethod(final String method, final @Nullable Class<?> optionsType, final boolean additive) {
+			this.method = method;
+			this.optionsType = optionsType;
+			this.additive = additive;
 		}
+
+		String method() {
+			return method;
+		}
+
+		/** @return the LSP4J type of this method's {@code Registration.registerOptions}, if it has one */
+		@Nullable
+		Class<?> optionsType() {
+			return optionsType;
+		}
+
+		/**
+		 * @return whether several concurrent registrations for this method are legitimate and combine
+		 *         additively (such methods do not carry a document selector)
+		 */
+		boolean isAdditive() {
+			return additive;
+		}
+
+		/** Applies one registration for this method to the effective capabilities. */
+		abstract void applyTo(ServerCapabilities caps, @Nullable Object options);
+
+		/** Register-time side effect of a registration for this method; no-op by default. */
+		void onRegister(final String id, final @Nullable Object options,
+				final FileSystemWatcherManager watcherManager) {
+		}
+
+		/** Unregister-time side effect of a registration for this method; no-op by default. */
+		void onUnregister(final String id, final FileSystemWatcherManager watcherManager) {
 		}
 	}
 }
