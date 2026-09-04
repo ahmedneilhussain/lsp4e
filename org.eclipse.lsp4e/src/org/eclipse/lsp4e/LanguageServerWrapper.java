@@ -891,12 +891,16 @@ public class LanguageServerWrapper {
 		}
 		final IDocument theDocument = document;
 		return castNonNull(initializeFuture).thenAcceptAsync(theVoid -> {
+			// Computed outside the connectedDocuments monitor: getCapabilities(uri) takes the
+			// registration monitor, under which capability queries resolve a document's language id
+			// by reading connectedDocuments - taking the monitors in the opposite order here would
+			// risk a deadlock.
+			TextDocumentSyncKind syncKind = initializeFuture == null ? null
+					: castNonNull(registrationManager.getCapabilities(uri)).getTextDocumentSync().map(Functions.identity(), TextDocumentSyncOptions::getChange);
 			synchronized (connectedDocuments) {
 				if (this.connectedDocuments.containsKey(uri)) {
 					return;
 				}
-				TextDocumentSyncKind syncKind = initializeFuture == null ? null
-						: castNonNull(registrationManager.getCapabilities(uri)).getTextDocumentSync().map(Functions.identity(), TextDocumentSyncOptions::getChange);
 				final var listener = new DocumentContentSynchronizer(this, castNonNull(context.languageServer), theDocument, syncKind);
 				theDocument.addPrenotifiedDocumentListener(listener);
 				LanguageServerWrapper.this.connectedDocuments.put(uri, listener);
@@ -1235,10 +1239,15 @@ public class LanguageServerWrapper {
 		return languageId;
 	}
 
+	/**
+	 * Resolves content types for a not-yet-connected document by file name only. Deliberately no
+	 * content-based detection: this runs on capability-query threads (possibly the UI thread) and
+	 * under the registration monitor, where reading file contents is not acceptable. The resulting
+	 * language id is a best-effort answer for pre-connection selector matching; the authoritative,
+	 * content-based id is computed when the document is opened and overwrites the cache (see
+	 * {@link #computeLanguageId(URI, IDocument)}).
+	 */
 	private static List<IContentType> getContentTypes(URI uri) {
-		if (LSPEclipseUtils.findResourceFor(uri) instanceof IFile file) {
-			return LSPEclipseUtils.getFileContentTypes(file);
-		}
 		String fileName = LSPEclipseUtils.getFileName(uri);
 		if (fileName != null) {
 			return List.of(Platform.getContentTypeManager().findContentTypesFor(fileName));
